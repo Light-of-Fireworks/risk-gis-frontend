@@ -105,8 +105,47 @@
       </div>
     </transition>
 
-    <!-- 右上角事件列表 -->
-    <div v-if="activeType" class="event-list-panel" :class="{ collapsed: !eventListVisible }">
+    <!-- 左下角台风信息面板 -->
+    <div v-if="activeType === 'typhoon' && warnings.length > 0" class="typhoon-info-panel" :class="{ collapsed: !eventListVisible }">
+      <div class="typhoon-info-header" @click="eventListVisible = !eventListVisible">
+        <span class="typhoon-info-title">台风信息</span>
+        <el-badge :value="warnings.length" :max="99" type="danger" class="event-badge" />
+        <el-icon class="event-toggle-icon">
+          <ArrowDown v-if="!eventListVisible" />
+          <ArrowUp v-else />
+        </el-icon>
+      </div>
+      <div v-show="eventListVisible" class="typhoon-info-body">
+        <div
+          v-for="(w, index) in typhoonInfoList"
+          :key="w.tfid || index"
+          class="typhoon-card"
+          @click="selectWarning(w)"
+        >
+          <div class="typhoon-name">{{ w.typhoonName }}</div>
+          <div class="typhoon-detail-row">
+            <span class="typhoon-detail-label">台风编号</span>
+            <span class="typhoon-detail-value">{{ w.typhoonNumber }}</span>
+          </div>
+          <div class="typhoon-detail-row">
+            <span class="typhoon-detail-label">起始时间</span>
+            <span class="typhoon-detail-value">{{ w.startTime }}</span>
+          </div>
+          <div class="typhoon-detail-row">
+            <span class="typhoon-detail-label">中心气压极值(百帕)</span>
+            <span class="typhoon-detail-value">{{ w.pressure }}</span>
+          </div>
+          <div class="typhoon-detail-row">
+            <span class="typhoon-detail-label">附近最大风速(米/秒)</span>
+            <span class="typhoon-detail-value">{{ w.speed }}</span>
+          </div>
+        </div>
+        <el-empty v-if="!loading && warnings.length === 0" description="暂无数据" :image-size="60" />
+      </div>
+    </div>
+
+    <!-- 右上角事件列表（地震/洪水） -->
+    <div v-if="activeType && activeType !== 'typhoon'" class="event-list-panel" :class="{ collapsed: !eventListVisible }">
       <div class="event-list-header" @click="eventListVisible = !eventListVisible">
         <span class="event-list-title">事件列表</span>
         <el-badge :value="warnings.length" :max="99" type="danger" class="event-badge" />
@@ -170,7 +209,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ArrowDown, ArrowUp, Loading } from '@element-plus/icons-vue'
 import MapContainer from '@/components/Map/MapContainer.vue'
 import { useMapStore } from '@/store/mapStore'
@@ -193,8 +232,10 @@ import VectorSource from 'ol/source/Vector'
 import Feature from 'ol/Feature'
 import Point from 'ol/geom/Point'
 import { Style, Fill, Stroke, Text as TextStyle, Circle as CircleStyle } from 'ol/style'
-import Overlay from 'ol/Overlay'
 import LineString from 'ol/geom/LineString'
+import MultiPoint from 'ol/geom/MultiPoint'
+import { unlistenByKey } from 'ol/events'
+import type { EventsKey } from 'ol/events'
 
 const mapStore = useMapStore()
 const loading = ref(false)
@@ -223,13 +264,139 @@ const depthRange = ref([0, 700])
 const eventListVisible = ref(true)
 const warnings = ref<Warning[]>([])
 
+// 台风信息列表（用于台风信息面板展示）
+const typhoonInfoList = computed(() => {
+  return warnings.value.map((w) => {
+    const typhoon = typhoonDataMap.value[w.tfid || '']
+    return {
+      ...w,
+      typhoonName: typhoon ? `${typhoon.name} ${typhoon.enName}` : w.content.split('(')[0] || '',
+      typhoonNumber: getTyphoonNumber(w.tfid || ''),
+      startTime: typhoon?.dataTime || w.time || '',
+      pressure: typhoon?.pressure || '--',
+      speed: typhoon?.speed || '--',
+    }
+  })
+})
+
+// 缓存台风原始数据，用于信息面板展示
+const typhoonDataMap = ref<Record<string, TyphoonData>>({})
+
+function getTyphoonNumber(tfid: string): string {
+  if (!tfid) return '--'
+  return tfid.length >= 4 ? tfid.slice(-4) : tfid
+}
+
 // 地图图层
 let earthquakeLayer: VectorLayer<VectorSource> | null = null
 let floodLayer: VectorLayer<VectorSource> | null = null
 let typhoonLayer: VectorLayer<VectorSource> | null = null
 let typhoonTrajectoryLayer: VectorLayer<VectorSource> | null = null
-let clickOverlay: Overlay | null = null
 let popupContainer: HTMLDivElement | null = null
+let mapClickKey: EventsKey | null = null
+let popupVisible = false
+
+// 台风轨迹点空间索引（存地图坐标，点击时 O(N) 查最近点，N<500 为微秒级）
+let trajectoryCoords: number[][] = []
+let trajectoryPoints: TyphoonPoint[] = []
+
+// 存储各类型标记的屏幕坐标，用于点击命中查询（绕过 forEachFeatureAtPixel）
+let typhoonMarkers: { data: any; coord: number[] }[] = []
+let otherMarkers: { data: any; coord: number[] }[] = []
+
+function findNearestFeature(clickPx: number[], markers: { data: any; coord: number[] }[], maxPxDist: number): any | null {
+  const map = mapStore.map
+  if (!map || markers.length === 0) return null
+  let minDist = Infinity
+  let nearest: any = null
+  for (const m of markers) {
+    const px = map.getPixelFromCoordinate(m.coord)
+    if (!px) continue
+    const dx = px[0] - clickPx[0]
+    const dy = px[1] - clickPx[1]
+    const d = dx * dx + dy * dy
+    if (d < minDist) {
+      minDist = d
+      nearest = m.data
+    }
+  }
+  if (minDist > maxPxDist * maxPxDist) return null
+  return nearest
+}
+
+// 预创建的弹窗子元素引用
+let popupTitleEl: HTMLDivElement | null = null
+let popupField1El: HTMLDivElement | null = null
+let popupField2El: HTMLDivElement | null = null
+let popupField3El: HTMLDivElement | null = null
+let popupField4El: HTMLDivElement | null = null
+let popupBtnEl: HTMLDivElement | null = null
+
+function createPopupField(): HTMLDivElement {
+  const el = document.createElement('div')
+  el.style.cssText = 'margin-bottom:4px;font-size:13px;'
+  return el
+}
+
+function ensurePopupStructure() {
+  if (!popupContainer || popupTitleEl) return
+  popupTitleEl = document.createElement('div')
+  popupTitleEl.style.cssText = 'font-weight:bold;margin-bottom:6px;color:#303133;'
+  popupContainer.appendChild(popupTitleEl)
+
+  popupField1El = createPopupField()
+  popupContainer.appendChild(popupField1El)
+  popupField2El = createPopupField()
+  popupContainer.appendChild(popupField2El)
+  popupField3El = createPopupField()
+  popupContainer.appendChild(popupField3El)
+  popupField4El = createPopupField()
+  popupContainer.appendChild(popupField4El)
+
+  popupBtnEl = document.createElement('div')
+  popupBtnEl.style.cssText = 'color:#409eff;font-size:12px;cursor:pointer;margin-top:4px;'
+  popupBtnEl.textContent = '点击查看轨迹详情 →'
+  popupContainer.appendChild(popupBtnEl)
+}
+
+function showPopup(coordinate: number[]) {
+  if (!popupContainer) return
+  // 隐藏未使用的字段（textContent 为空的）
+  ;[popupField1El, popupField2El, popupField3El, popupField4El, popupBtnEl].forEach((el) => {
+    if (el) el.style.display = el.textContent ? '' : 'none'
+  })
+  // 用 CSS 定位弹窗，绕过 OL Overlay 触发的同步重绘
+  const map = mapStore.map
+  if (map) {
+    const px = map.getPixelFromCoordinate(coordinate)
+    if (px) {
+      popupContainer.style.left = px[0] + 'px'
+      popupContainer.style.top = px[1] + 'px'
+      popupContainer.style.transform = 'translate(-50%, -100%)'
+    }
+  }
+  popupContainer.style.visibility = 'visible'
+  popupVisible = true
+}
+
+function resetPopupFields() {
+  ;[popupField1El, popupField2El, popupField3El, popupField4El, popupBtnEl].forEach((el) => {
+    if (el) {
+      el.textContent = ''
+      el.style.display = ''
+      el.style.color = ''
+    }
+  })
+}
+
+function hidePopup() {
+  if (!popupContainer) return
+  popupContainer.style.visibility = 'hidden'
+  popupVisible = false
+}
+
+// 轨迹数据缓存：避免同一台风重复请求 API 和重建 Feature
+const trajectoryCache = new Map<string, { points: TyphoonPoint[]; features: Feature[] }>()
 
 interface Warning {
   id: number
@@ -252,11 +419,22 @@ function toggleType(type: string) {
     activeType.value = null
     clearAllLayers()
     warnings.value = []
+    typhoonDataMap.value = {}
     return
   }
   activeType.value = type
   clearAllLayers()
   warnings.value = []
+  typhoonDataMap.value = {}
+  // 重置各灾害类型筛选状态
+  typhoonMode.value = 'realtime'
+  selectedYear.value = null
+  selectedTyphoonIds.value = []
+  yearTyphoons.value = []
+  floodDateRange.value = null
+  earthquakeDateRange.value = null
+  magnitudeRange.value = [0, 10]
+  depthRange.value = [0, 700]
   loadDataForType(type)
 }
 
@@ -265,7 +443,12 @@ function clearAllLayers() {
   if (floodLayer) floodLayer.setSource(new VectorSource())
   if (typhoonLayer) typhoonLayer.setSource(new VectorSource())
   if (typhoonTrajectoryLayer) typhoonTrajectoryLayer.setSource(new VectorSource())
-  if (clickOverlay) clickOverlay.setPosition(undefined)
+  hidePopup()
+  trajectoryCache.clear()
+  trajectoryCoords = []
+  trajectoryPoints = []
+  typhoonMarkers = []
+  otherMarkers = []
 }
 
 function loadDataForType(type: string) {
@@ -287,6 +470,7 @@ function loadDataForType(type: string) {
 function onTyphoonModeChange(mode: string) {
   clearAllLayers()
   warnings.value = []
+  typhoonDataMap.value = {}
   selectedTyphoonIds.value = []
   selectedYear.value = null
   yearTyphoons.value = []
@@ -306,6 +490,7 @@ async function onYearChange(year: number) {
   yearTyphoons.value = await getTyphoonsByYear(year)
   clearAllLayers()
   warnings.value = []
+  typhoonDataMap.value = {}
 }
 
 async function onTyphoonSelect(ids: string[]) {
@@ -313,6 +498,7 @@ async function onTyphoonSelect(ids: string[]) {
     if (typhoonLayer) typhoonLayer.setSource(new VectorSource())
     if (typhoonTrajectoryLayer) typhoonTrajectoryLayer.setSource(new VectorSource())
     warnings.value = []
+    typhoonDataMap.value = {}
     return
   }
 
@@ -320,8 +506,13 @@ async function onTyphoonSelect(ids: string[]) {
   try {
     const allPoints: { tfid: string; points: TyphoonPoint[] }[] = []
     const selectedTyphoons = yearTyphoons.value.filter((t) => ids.includes(t.tfid))
+    const typhoonMap: Record<string, TyphoonData> = {}
+    selectedTyphoons.forEach((t) => { typhoonMap[t.tfid] = t })
+    typhoonDataMap.value = typhoonMap
+    typhoonMarkers = selectedTyphoons
+      .filter((t) => t.lat != null && t.lng != null)
+      .map((t) => ({ data: t, coord: fromLonLat([t.lng, t.lat]) }))
 
-    // 为每个选中的台风加载轨迹
     for (const tfid of ids) {
       const points = await getTyphoonPoints(tfid)
       if (points.length > 0) {
@@ -329,26 +520,40 @@ async function onTyphoonSelect(ids: string[]) {
       }
     }
 
-    // 更新台风标记图层
     const layer = ensureTyphoonLayer()
     if (layer) {
-      layer.setSource(new VectorSource({ features: createTyphoonFeatures(selectedTyphoons) }))
+      const typhoonFeatures = createTyphoonFeatures(selectedTyphoons)
+      const existingTyphoonSource = layer.getSource()
+      if (existingTyphoonSource) {
+        existingTyphoonSource.clear()
+        existingTyphoonSource.addFeatures(typhoonFeatures)
+      } else {
+        layer.setSource(new VectorSource({ features: typhoonFeatures }))
+      }
     }
 
-    // 更新轨迹图层
     const trajLayer = ensureTyphoonTrajectoryLayer()
     if (trajLayer) {
       const allFeatures: Feature[] = []
+      const mergedPoints: TyphoonPoint[] = []
       for (const item of allPoints) {
-        allFeatures.push(...createTyphoonTrajectoryFeatures(item.points))
+        mergedPoints.push(...item.points)
+        allFeatures.push(...createTyphoonTrajectoryLineFeatures(item.points))
       }
-      trajLayer.setSource(new VectorSource({ features: allFeatures }))
+      if (mergedPoints.length > 0) {
+        allFeatures.push(...createTyphoonTrajectoryPointFeatures(mergedPoints))
+      }
+      const existingSource = trajLayer.getSource()
+      if (existingSource) {
+        existingSource.clear()
+        existingSource.addFeatures(allFeatures)
+      } else {
+        trajLayer.setSource(new VectorSource({ features: allFeatures }))
+      }
     }
 
-    // 更新事件列表
     warnings.value = convertTyphoonToWarnings(selectedTyphoons)
 
-    // 缩放到轨迹范围
     const map = mapStore.map
     if (map && allPoints.length > 0) {
       const allCoords: number[][] = []
@@ -359,7 +564,7 @@ async function onTyphoonSelect(ids: string[]) {
       }
       if (allCoords.length > 0) {
         const extent = new LineString(allCoords).getExtent()
-        map.getView().fit(extent, { padding: [100, 400, 100, 100], duration: 500 })
+        map.getView().fit(extent, { padding: [100, 400, 100, 100], duration: 0 })
       }
     }
   } finally {
@@ -371,9 +576,16 @@ async function fetchActiveTyphoons() {
   loading.value = true
   try {
     const data = await getActiveTyphoons()
+    // 缓存台风原始数据
+    const typhoonMap: Record<string, TyphoonData> = {}
+    data.forEach((t) => { typhoonMap[t.tfid] = t })
+    typhoonDataMap.value = typhoonMap
     warnings.value = convertTyphoonToWarnings(data)
+    typhoonMarkers = data
+      .filter((t) => t.lat != null && t.lng != null)
+      .map((t) => ({ data: t, coord: fromLonLat([t.lng, t.lat]) }))
 
-    if (clickOverlay) clickOverlay.setPosition(undefined)
+    hidePopup()
     if (typhoonTrajectoryLayer) typhoonTrajectoryLayer.setSource(new VectorSource())
 
     const layer = ensureTyphoonLayer()
@@ -401,8 +613,11 @@ async function fetchFloodData() {
       data = await getFloodWarningData('7d')
     }
     warnings.value = convertFloodToWarnings(data)
+    otherMarkers = data
+      .filter((d) => d.latitude != null && d.longitude != null)
+      .map((d) => ({ data: d, coord: fromLonLat([d.longitude, d.latitude]) }))
 
-    if (clickOverlay) clickOverlay.setPosition(undefined)
+    hidePopup()
 
     const layer = ensureFloodLayer()
     if (layer) {
@@ -431,8 +646,11 @@ async function fetchEarthquakeData() {
       maxDepth: depthRange.value[1] < 700 ? depthRange.value[1] : undefined,
     })
     warnings.value = convertEarthquakeToWarnings(data)
+    otherMarkers = data
+      .filter((d) => d.latitude != null && d.longitude != null)
+      .map((d) => ({ data: d, coord: fromLonLat([d.longitude, d.latitude]) }))
 
-    if (clickOverlay) clickOverlay.setPosition(undefined)
+    hidePopup()
 
     const layer = ensureEarthquakeLayer()
     if (layer) {
@@ -450,49 +668,55 @@ function selectWarning(warning: Warning) {
   if (!map || warning.lng == null || warning.lat == null) return
 
   const coord = fromLonLat([warning.lng, warning.lat])
-  map.getView().animate({ center: coord, zoom: 14, duration: 500 }, () => {
-    if (activeType.value === 'flood' && floodLayer) {
-      const source = floodLayer.getSource()
-      if (source) {
-        const match = source.getFeatures().find((f) => {
-          const fw = f.get('flood') as FloodWarningData
-          return fw && fw.wrInfoId === warning.id
-        })
-        if (match) {
-          const fw = match.get('flood') as FloodWarningData
-          const geom = match.getGeometry() as Point
-          showFloodPopup(fw, geom.getCoordinates())
-        }
-      }
-    } else if (activeType.value === 'typhoon' && typhoonLayer) {
-      const source = typhoonLayer.getSource()
-      if (source) {
-        const match = source.getFeatures().find((f) => {
-          const ty = f.get('typhoon') as TyphoonData
-          return ty && ty.tfid === warning.tfid
-        })
-        if (match) {
-          const ty = match.get('typhoon') as TyphoonData
-          const geom = match.getGeometry() as Point
-          showTyphoonPopup(ty, geom.getCoordinates())
-          loadTyphoonTrajectory(ty.tfid)
-        }
-      }
-    } else if (activeType.value === 'earthquake' && earthquakeLayer) {
-      const source = earthquakeLayer.getSource()
-      if (source) {
-        const match = source.getFeatures().find((f) => {
-          const eq = f.get('earthquake') as EarthquakeData
-          return eq && eq.longitude === warning.lng && eq.latitude === warning.lat
-        })
-        if (match) {
-          const eq = match.get('earthquake') as EarthquakeData
-          const geom = match.getGeometry() as Point
-          showEarthquakePopup(eq, geom.getCoordinates())
-        }
+
+  // 台风：直接定位而不动画，避免与后续 loadTyphoonTrajectory 的 fit 动叠加造成 ~1 秒钟双重动画
+  if (activeType.value === 'typhoon' && typhoonLayer) {
+    const source = typhoonLayer.getSource()
+    if (source) {
+      const match = source.getFeatures().find((f) => {
+        const ty = f.get('typhoon') as TyphoonData
+        return ty && ty.tfid === warning.tfid
+      })
+      if (match) {
+        const ty = match.get('typhoon') as TyphoonData
+        const geom = match.getGeometry() as Point
+        showTyphoonPopup(ty, geom.getCoordinates())
+        loadTyphoonTrajectory(ty.tfid)
       }
     }
-  })
+    map.getView().animate({ center: coord, zoom: 14, duration: 250 })
+  } else {
+    // 其他类型保持 500ms 动画
+    map.getView().animate({ center: coord, zoom: 14, duration: 500 }, () => {
+      if (activeType.value === 'flood' && floodLayer) {
+        const source = floodLayer.getSource()
+        if (source) {
+          const match = source.getFeatures().find((f) => {
+            const fw = f.get('flood') as FloodWarningData
+            return fw && fw.wrInfoId === warning.id
+          })
+          if (match) {
+            const fw = match.get('flood') as FloodWarningData
+            const geom = match.getGeometry() as Point
+            showFloodPopup(fw, geom.getCoordinates())
+          }
+        }
+      } else if (activeType.value === 'earthquake' && earthquakeLayer) {
+        const source = earthquakeLayer.getSource()
+        if (source) {
+          const match = source.getFeatures().find((f) => {
+            const eq = f.get('earthquake') as EarthquakeData
+            return eq && eq.longitude === warning.lng && eq.latitude === warning.lat
+          })
+          if (match) {
+            const eq = match.get('earthquake') as EarthquakeData
+            const geom = match.getGeometry() as Point
+            showEarthquakePopup(eq, geom.getCoordinates())
+          }
+        }
+      }
+    })
+  }
 }
 
 // ============ 图层工具函数 ============
@@ -602,15 +826,15 @@ function createEarthquakeFeatures(data: EarthquakeData[]): Feature[] {
 }
 
 function showEarthquakePopup(eq: EarthquakeData, coordinate: number[]) {
-  if (!popupContainer || !clickOverlay) return
-  popupContainer.innerHTML = `
-    <div style="font-weight:bold;margin-bottom:6px;color:#303133;">${eq.magnitude}级地震</div>
-    <div style="margin-bottom:4px;">📍 ${eq.location}</div>
-    <div style="margin-bottom:4px;">🕐 ${eq.occurTime}</div>
-    <div style="margin-bottom:4px;">📏 震源深度 ${eq.depth} 千米</div>
-    <div style="color:#909399;font-size:12px;">播报时间: ${eq.reportTime}</div>
-  `
-  clickOverlay.setPosition(coordinate)
+  if (!popupContainer) return
+  ensurePopupStructure()
+  resetPopupFields()
+  popupTitleEl!.textContent = `${eq.magnitude}级地震`
+  popupField1El!.textContent = `${eq.location}`
+  popupField2El!.textContent = `${eq.occurTime}`
+  popupField3El!.textContent = `震源深度 ${eq.depth} 千米`
+  popupField4El!.textContent = `播报时间: ${eq.reportTime}`
+  showPopup(coordinate)
 }
 
 // ============ 洪水相关 ============
@@ -662,18 +886,17 @@ function createFloodFeatures(data: FloodWarningData[]): Feature[] {
 }
 
 function showFloodPopup(fw: FloodWarningData, coordinate: number[]) {
-  if (!popupContainer || !clickOverlay) return
-  popupContainer.innerHTML = `
-    <div style="font-weight:bold;margin-bottom:6px;color:#303133;">${fw.wrTitle}</div>
-    <div style="margin-bottom:4px;color:${getFloodLevelColor(fw.wrLevel)}">⚠ ${fw.wrLevel}</div>
-    <div style="margin-bottom:4px;">📍 ${fw.influenceArea}</div>
-    <div style="margin-bottom:4px;">🏢 ${fw.unitName}</div>
-    <div style="margin-bottom:4px;">🕐 发布: ${fw.publishTime}</div>
-    <div style="margin-bottom:4px;">⏰ 失效: ${fw.expireTime}</div>
-    <div style="margin-bottom:4px;font-size:12px;color:#606266;max-height:100px;overflow-y:auto;">${fw.wrDetail}</div>
-    <div style="color:#909399;font-size:12px;"><a href="${fw.detailUrl}" target="_blank" style="color:#409eff;">查看详情</a></div>
-  `
-  clickOverlay.setPosition(coordinate)
+  if (!popupContainer) return
+  ensurePopupStructure()
+  resetPopupFields()
+  popupTitleEl!.textContent = fw.wrTitle
+  popupField1El!.textContent = `${fw.wrLevel}`
+  popupField1El!.style.color = getFloodLevelColor(fw.wrLevel)
+  popupField2El!.textContent = `${fw.influenceArea} | ${fw.unitName}`
+  popupField3El!.textContent = `发布: ${fw.publishTime}  失效: ${fw.expireTime}`
+  popupField4El!.textContent = fw.wrDetail
+  popupField4El!.style.cssText += 'font-size:12px;color:#606266;max-height:100px;overflow-y:auto;'
+  showPopup(coordinate)
 }
 
 // ============ 台风相关 ============
@@ -728,137 +951,215 @@ function createTyphoonFeatures(data: TyphoonData[]): Feature[] {
     })
 }
 
-function createTyphoonTrajectoryFeatures(points: TyphoonPoint[]): Feature[] {
-  const features: Feature[] = []
-  if (!points || points.length === 0) return features
+// 降采样：保留首尾点，中间均匀取样，最多 maxCount 个点
+function downsamplePoints(points: TyphoonPoint[], maxCount: number): { sampled: TyphoonPoint[], indices: number[] } {
+  if (points.length <= maxCount) {
+    return { sampled: points, indices: points.map((_, i) => i) }
+  }
+  const step = (points.length - 1) / (maxCount - 1)
+  const sampled: TyphoonPoint[] = []
+  const indices: number[] = []
+  for (let i = 0; i < maxCount; i++) {
+    const idx = Math.round(i * step)
+    sampled.push(points[idx])
+    indices.push(idx)
+  }
+  return { sampled, indices }
+}
 
-  // 轨迹线
+// 单个台风的轨迹线（LineString）
+function createTyphoonTrajectoryLineFeatures(points: TyphoonPoint[]): Feature[] {
+  if (!points || points.length === 0) return []
   const coords = points.map((p) => fromLonLat([parseFloat(p.lng), parseFloat(p.lat)]))
-  const lineFeature = new Feature({
-    geometry: new LineString(coords),
-  })
+  const lineFeature = new Feature({ geometry: new LineString(coords) })
   lineFeature.setStyle(
     new Style({
       stroke: new Stroke({ color: '#ff6600', width: 2, lineDash: [8, 4] }),
     })
   )
-  features.push(lineFeature)
+  return [lineFeature]
+}
 
-  // 轨迹点
-  points.forEach((p, index) => {
-    const feature = new Feature({
-      geometry: new Point(fromLonLat([parseFloat(p.lng), parseFloat(p.lat)])),
-      typhoonPoint: p,
-    })
-    const radius = 3 + (index / points.length) * 5
-    const color = getTyphoonColor(p.strong || '')
-    feature.setStyle(
-      new Style({
-        image: new CircleStyle({
-          radius,
-          fill: new Fill({ color }),
-          stroke: new Stroke({ color: '#fff', width: 1 }),
-        }),
-      })
-    )
-    features.push(feature)
+// 合并多个台风的轨迹点为一个 MultiPoint（用于渲染 + 点击检测）
+function createTyphoonTrajectoryPointFeatures(points: TyphoonPoint[]): Feature[] {
+  if (!points || points.length === 0) return []
+
+  // 保存全部点坐标用于点击命中
+  const allCoords = points.map((p) => fromLonLat([parseFloat(p.lng), parseFloat(p.lat)]))
+  trajectoryCoords = allCoords
+  trajectoryPoints = points
+
+  // 降采样用于渲染，最多 60 个点
+  const { sampled, indices } = downsamplePoints(points, 60)
+  const sampledCoords = indices.map((i) => allCoords[i])
+
+  const multiFeature = new Feature({
+    geometry: new MultiPoint(sampledCoords),
   })
+  multiFeature.set('isTrajectoryMultiPoint', true)
+  const cachedStyles: Style[] = sampledCoords.map((coord, i) => {
+    const origIdx = indices[i]
+    const radius = 3 + (origIdx / points.length) * 5
+    const color = getTyphoonColor(sampled[i].strong || '')
+    return new Style({
+      geometry: new Point(coord),
+      image: new CircleStyle({
+        radius,
+        fill: new Fill({ color }),
+        stroke: new Stroke({ color: '#fff', width: 1 }),
+      }),
+    })
+  })
+  multiFeature.setStyle(cachedStyles)
+  return [multiFeature]
+}
 
-  return features
+function findClickedTrajectoryPoint(clickCoord: number[]): TyphoonPoint | null {
+  if (trajectoryCoords.length === 0) return null
+  const map = mapStore.map
+  if (!map) return null
+  const clickPx = map.getPixelFromCoordinate(clickCoord)
+  if (!clickPx) return null
+
+  const maxPxDist = 10
+  let minDist = Infinity
+  let idx = -1
+  for (let i = 0; i < trajectoryCoords.length; i++) {
+    const px = map.getPixelFromCoordinate(trajectoryCoords[i])
+    if (!px) continue
+    const dx = px[0] - clickPx[0]
+    const dy = px[1] - clickPx[1]
+    const d = dx * dx + dy * dy
+    if (d < minDist) {
+      minDist = d
+      idx = i
+    }
+  }
+  if (idx < 0 || minDist > maxPxDist * maxPxDist) return null
+  return trajectoryPoints[idx]
 }
 
 function showTyphoonPopup(typhoon: TyphoonData, coordinate: number[]) {
-  if (!popupContainer || !clickOverlay) return
-  const statusText = typhoon.isActive
-    ? `<span style="color:#67c23a;">● 活跃</span>`
-    : `<span style="color:#909399;">● 已停止</span>`
-  popupContainer.innerHTML = `
-    <div style="font-weight:bold;margin-bottom:6px;color:#303133;">🌀 ${typhoon.name} (${typhoon.enName}) ${statusText}</div>
-    ${typhoon.strong ? `<div style="margin-bottom:4px;color:${getTyphoonColor(typhoon.strong)}">强度: ${typhoon.strong}</div>` : ''}
-    ${typhoon.power ? `<div style="margin-bottom:4px;">风力: ${typhoon.power}级 | 风速: ${typhoon.speed}m/s</div>` : ''}
-    ${typhoon.pressure ? `<div style="margin-bottom:4px;">气压: ${typhoon.pressure} hPa</div>` : ''}
-    ${typhoon.moveDirection ? `<div style="margin-bottom:4px;">移动: ${typhoon.moveDirection} ${typhoon.moveSpeed}km/h</div>` : ''}
-    ${typhoon.radius7 ? `<div style="margin-bottom:4px;">7级风圈: ${typhoon.radius7}km | 10级风圈: ${typhoon.radius10}km</div>` : ''}
-    ${typhoon.lat && typhoon.lng ? `<div style="margin-bottom:4px;">📍 ${typhoon.lat}°N, ${typhoon.lng}°E</div>` : ''}
-    ${typhoon.dataTime ? `<div style="margin-bottom:4px;font-size:12px;color:#909399;">更新: ${typhoon.dataTime}</div>` : ''}
-    <div style="color:#409eff;font-size:12px;cursor:pointer;" id="typhoon-detail-btn">点击查看轨迹详情 →</div>
-  `
-  clickOverlay.setPosition(coordinate)
-
-  setTimeout(() => {
-    const btn = document.getElementById('typhoon-detail-btn')
-    if (btn) {
-      btn.onclick = () => loadTyphoonTrajectory(typhoon.tfid)
-    }
-  }, 0)
+  if (!popupContainer) return
+  ensurePopupStructure()
+  resetPopupFields()
+  const status = typhoon.isActive ? '● 活跃' : '● 已停止'
+  popupTitleEl!.textContent = `🌀 ${typhoon.name} (${typhoon.enName}) ${status}`
+  popupField1El!.textContent = typhoon.strong ? `强度: ${typhoon.strong}` : ''
+  popupField1El!.style.color = getTyphoonColor(typhoon.strong || '')
+  popupField2El!.textContent = typhoon.power ? `风力: ${typhoon.power}级 | 风速: ${typhoon.speed}m/s` : ''
+  popupField3El!.textContent = typhoon.pressure ? `气压: ${typhoon.pressure} hPa` : ''
+  popupField4El!.textContent = typhoon.dataTime ? `更新: ${typhoon.dataTime}` : ''
+  popupField4El!.style.color = '#909399'
+  popupBtnEl!.textContent = '点击查看轨迹详情 →'
+  popupBtnEl!.onclick = () => loadTyphoonTrajectory(typhoon.tfid)
+  showPopup(coordinate)
 }
 
 function showTyphoonPointPopup(point: TyphoonPoint, coordinate: number[]) {
-  if (!popupContainer || !clickOverlay) return
-  popupContainer.innerHTML = `
-    <div style="font-weight:bold;margin-bottom:6px;color:#303133;">轨迹点详情</div>
-    <div style="margin-bottom:4px;">🕐 ${point.pointTime}</div>
-    <div style="margin-bottom:4px;color:${getTyphoonColor(point.strong || '')}">强度: ${point.strong}</div>
-    <div style="margin-bottom:4px;">风力: ${point.power}级 | 风速: ${point.speed}m/s</div>
-    <div style="margin-bottom:4px;">气压: ${point.pressure} hPa</div>
-    <div style="margin-bottom:4px;">移动: ${point.moveDirection} ${point.moveSpeed}km/h</div>
-    <div style="margin-bottom:4px;">📍 ${point.lat}°N, ${point.lng}°E</div>
-  `
-  clickOverlay.setPosition(coordinate)
+  if (!popupContainer) return
+  ensurePopupStructure()
+  resetPopupFields()
+  popupTitleEl!.textContent = '轨迹点详情'
+  popupField1El!.textContent = `${point.pointTime}`
+  popupField2El!.textContent = `强度: ${point.strong}`
+  popupField2El!.style.color = getTyphoonColor(point.strong || '')
+  popupField3El!.textContent = `风力: ${point.power}级 | 风速: ${point.speed}m/s`
+  popupField4El!.textContent = `气压: ${point.pressure} hPa  📍 ${point.lat}°N, ${point.lng}°E`
+  showPopup(coordinate)
 }
 
 async function loadTyphoonTrajectory(tfid: string) {
-  const points = await getTyphoonPoints(tfid)
-  if (!points || points.length === 0) return
-
-  if (typhoonTrajectoryLayer) {
-    typhoonTrajectoryLayer.setSource(new VectorSource())
+  let cached = trajectoryCache.get(tfid)
+  if (!cached) {
+    const points = await getTyphoonPoints(tfid)
+    if (!points || points.length === 0) return
+    const features = [
+      ...createTyphoonTrajectoryLineFeatures(points),
+      ...createTyphoonTrajectoryPointFeatures(points),
+    ]
+    cached = { points, features }
+    trajectoryCache.set(tfid, cached)
   }
 
-  const layer = ensureTyphoonTrajectoryLayer()
-  if (layer) {
-    layer.setSource(new VectorSource({ features: createTyphoonTrajectoryFeatures(points) }))
+  const trajLayer = ensureTyphoonTrajectoryLayer()
+  if (trajLayer) {
+    const existingSource = trajLayer.getSource()
+    if (existingSource) {
+      existingSource.clear()
+      existingSource.addFeatures(cached.features)
+    } else {
+      trajLayer.setSource(new VectorSource({ features: cached.features }))
+    }
   }
 
   const map = mapStore.map
-  if (map && points.length > 0) {
-    const coords = points.map((p) => fromLonLat([parseFloat(p.lng), parseFloat(p.lat)]))
+  if (map && cached.points.length > 0) {
+    const coords = cached.points.map((p) => fromLonLat([parseFloat(p.lng), parseFloat(p.lat)]))
     const extent = new LineString(coords).getExtent()
-    map.getView().fit(extent, { padding: [50, 50, 50, 50], duration: 500 })
+    map.getView().fit(extent, { padding: [50, 50, 50, 50], duration: 0 })
   }
 }
 
 // ============ 地图弹窗设置 ============
 
+let visibilityHandler: (() => void) | null = null
+
 function setupMapOverlay() {
   const map = mapStore.map
   if (!map) return
 
+  // 防止重复注册
+  if (popupContainer) return
+
+  // 切回浏览器时，canvas 可能已失效，OpenLayers 会在下次事件中同步重绘（阻塞主线程）
+  // 提前用 rAF 触发一次异步渲染，避免阻塞 pointerup/click
+  visibilityHandler = () => {
+    if (document.visibilityState === 'visible') {
+      requestAnimationFrame(() => { map.render() })
+    }
+  }
+  document.addEventListener('visibilitychange', visibilityHandler)
+
   popupContainer = document.createElement('div')
   popupContainer.className = 'disaster-popup'
   popupContainer.style.cssText =
-    'background:#fff;padding:10px 14px;border-radius:6px;box-shadow:0 2px 12px rgba(0,0,0,0.2);font-size:13px;min-width:180px;position:relative;'
-  document.body.appendChild(popupContainer)
+    'background:#fff;padding:10px 14px;border-radius:6px;box-shadow:0 2px 12px rgba(0,0,0,0.2);font-size:13px;min-width:180px;position:absolute;pointer-events:auto;z-index:100;visibility:hidden;'
+  // 直接挂到地图容器，用 CSS 定位，不使用 OL Overlay（避免触发同步重绘）
+  map.getTargetElement().appendChild(popupContainer)
 
-  clickOverlay = new Overlay({
-    element: popupContainer,
-    autoPan: true,
-  })
-  map.addOverlay(clickOverlay)
+  mapClickKey = map.on('click', (evt: any) => {
+    const coordinate = evt.coordinate
+    const clickPx = evt.pixel as [number, number]
 
-  map.on('click', (evt: any) => {
-    const feature = map.forEachFeatureAtPixel(evt.pixel, (f: any) => f)
-    if (feature && feature.get('earthquake')) {
-      showEarthquakePopup(feature.get('earthquake') as EarthquakeData, evt.coordinate)
-    } else if (feature && feature.get('flood')) {
-      showFloodPopup(feature.get('flood') as FloodWarningData, evt.coordinate)
-    } else if (feature && feature.get('typhoon')) {
-      showTyphoonPopup(feature.get('typhoon') as TyphoonData, evt.coordinate)
-    } else if (feature && feature.get('typhoonPoint')) {
-      showTyphoonPointPopup(feature.get('typhoonPoint') as TyphoonPoint, evt.coordinate)
-    } else {
-      clickOverlay.setPosition(undefined)
+    // 完全绕过 forEachFeatureAtPixel，用坐标距离做命中查询（微秒级）
+
+    // 1. 查轨迹点
+    const trajectoryHit = findClickedTrajectoryPoint(coordinate)
+    if (trajectoryHit) {
+      showTyphoonPointPopup(trajectoryHit, coordinate)
+      return
     }
+
+    // 2. 查台风标记
+    const typhoonHit = findNearestFeature(clickPx, typhoonMarkers, 15)
+    if (typhoonHit) {
+      showTyphoonPopup(typhoonHit as TyphoonData, coordinate)
+      return
+    }
+
+    // 3. 查地震/洪水等其他标记
+    const otherHit = findNearestFeature(clickPx, otherMarkers, 15)
+    if (otherHit && (otherHit as any).magnitude != null) {
+      showEarthquakePopup(otherHit as EarthquakeData, coordinate)
+      return
+    }
+    if (otherHit && (otherHit as any).wrLevel) {
+      showFloodPopup(otherHit as FloodWarningData, coordinate)
+      return
+    }
+
+    hidePopup()
   })
 }
 
@@ -882,7 +1183,14 @@ onUnmounted(() => {
   if (map && floodLayer) map.removeLayer(floodLayer)
   if (map && typhoonLayer) map.removeLayer(typhoonLayer)
   if (map && typhoonTrajectoryLayer) map.removeLayer(typhoonTrajectoryLayer)
-  if (map && clickOverlay) map.removeOverlay(clickOverlay)
+  if (mapClickKey) {
+    unlistenByKey(mapClickKey)
+    mapClickKey = null
+  }
+  if (visibilityHandler) {
+    document.removeEventListener('visibilitychange', visibilityHandler)
+    visibilityHandler = null
+  }
   if (popupContainer && popupContainer.parentNode) {
     popupContainer.parentNode.removeChild(popupContainer)
   }
@@ -1090,6 +1398,89 @@ onUnmounted(() => {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+/* 台风信息面板（左下角） */
+.typhoon-info-panel {
+  position: absolute;
+  bottom: 60px;
+  left: 10px;
+  width: 320px;
+  max-height: 400px;
+  background: rgba(255, 255, 255, 0.95);
+  border-radius: 8px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  backdrop-filter: blur(8px);
+  overflow: hidden;
+}
+
+.typhoon-info-header {
+  display: flex;
+  align-items: center;
+  padding: 10px 14px;
+  cursor: pointer;
+  border-bottom: 1px solid #ebeef5;
+  flex-shrink: 0;
+
+  &:hover {
+    background: #f5f7fa;
+  }
+}
+
+.typhoon-info-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.typhoon-info-body {
+  overflow-y: auto;
+  max-height: 350px;
+  padding: 4px 0;
+}
+
+.typhoon-card {
+  padding: 10px 14px;
+  border-bottom: 1px solid #f0f0f0;
+  cursor: pointer;
+  transition: background-color 0.2s;
+
+  &:hover {
+    background-color: #f5f7fa;
+  }
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.typhoon-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: #303133;
+  margin-bottom: 8px;
+}
+
+.typhoon-detail-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.typhoon-detail-label {
+  color: #909399;
+  flex-shrink: 0;
+}
+
+.typhoon-detail-value {
+  color: #303133;
+  font-weight: 500;
+  text-align: right;
 }
 
 /* 加载状态 */

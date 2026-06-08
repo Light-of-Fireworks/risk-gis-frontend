@@ -104,33 +104,8 @@ function initMap() {
 
     // 右下角：经纬度 + 比例尺
     updateScale()
-    mapInstance.on('moveend', updateScale)
-    mapInstance.on('pointermove', (evt: any) => {
-      if (evt.coordinate) {
-        const [lng, lat] = toLonLat(evt.coordinate)
-        coordText.value = `LAT：${lat.toFixed(5)}  LON：${lng.toFixed(5)}`
-      }
-    })
-    mapRef.value.addEventListener('pointerleave', () => {
-      coordText.value = ''
-    })
-
-    // 创建绘图图层
-    drawLayer = new VectorLayer({
-      source: new VectorSource(),
-      style: new Style({
-        stroke: new Stroke({ color: '#409eff', width: 3 }),
-        fill: new Fill({ color: 'rgba(64, 158, 255, 0.2)' }),
-        image: new CircleStyle({
-          radius: 7,
-          fill: new Fill({ color: '#409eff' }),
-          stroke: new Stroke({ color: '#fff', width: 2 }),
-        }),
-      }),
-    })
-    mapInstance.addLayer(drawLayer)
-
     mapInstance.on('moveend', () => {
+      updateScale()
       if (mapInstance) {
         const view = mapInstance.getView()
         const center = view.getCenter()
@@ -152,7 +127,7 @@ function initMap() {
                 coord = geom.getLastCoordinate()
               }
               if (coord) {
-                const pixel = mapInstance.getPixelFromCoordinate(coord)
+                const pixel = mapInstance!.getPixelFromCoordinate(coord)
                 if (pixel) {
                   item.element.style.left = pixel[0] + 'px'
                   item.element.style.top = (pixel[1] - 15) + 'px'
@@ -163,6 +138,37 @@ function initMap() {
         })
       }
     })
+
+    // 用 rAF 节流 pointermove，每帧最多更新一次坐标
+    let coordRafId = 0
+    mapInstance.on('pointermove', (evt: any) => {
+      if (coordRafId) return
+      coordRafId = requestAnimationFrame(() => {
+        coordRafId = 0
+        if (evt.coordinate) {
+          const [lng, lat] = toLonLat(evt.coordinate)
+          coordText.value = `LAT：${lat.toFixed(5)}  LON：${lng.toFixed(5)}`
+        }
+      })
+    })
+    mapRef.value.addEventListener('pointerleave', () => {
+      coordText.value = ''
+    })
+
+    // 创建绘图图层
+    drawLayer = new VectorLayer({
+      source: new VectorSource(),
+      style: new Style({
+        stroke: new Stroke({ color: '#409eff', width: 3 }),
+        fill: new Fill({ color: 'rgba(64, 158, 255, 0.2)' }),
+        image: new CircleStyle({
+          radius: 7,
+          fill: new Fill({ color: '#409eff' }),
+          stroke: new Stroke({ color: '#fff', width: 2 }),
+        }),
+      }),
+    })
+    mapInstance.addLayer(drawLayer)
 
     loading.value = false
   } else {
