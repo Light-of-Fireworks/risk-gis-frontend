@@ -61,6 +61,15 @@
               />
             </el-select>
           </template>
+
+          <!-- 台风保单查询 -->
+          <TyphoonPolicyQuery
+            :get-typhoon-data="getTyphoonData"
+            @query-result="onTyphoonQueryResult"
+            @query-start="onTyphoonQueryStart"
+            @query-end="onTyphoonQueryEnd"
+            @buffer-data="onBufferData"
+          />
         </template>
 
         <!-- 洪水筛选 -->
@@ -144,6 +153,12 @@
       </div>
     </div>
 
+    <!-- 台风保单统计面板 -->
+    <TyphoonStatsPanel
+      :visible="showTyphoonStats"
+      :data="typhoonStatsData"
+    />
+
     <!-- 右上角事件列表（地震/洪水） -->
     <div v-if="activeType && activeType !== 'typhoon'" class="event-list-panel" :class="{ collapsed: !eventListVisible }">
       <div class="event-list-header" @click="eventListVisible = !eventListVisible">
@@ -212,6 +227,9 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ArrowDown, ArrowUp, Loading } from '@element-plus/icons-vue'
 import MapContainer from '@/components/Map/MapContainer.vue'
+import TyphoonPolicyQuery from '@/components/Map/TyphoonPolicyQuery.vue'
+import TyphoonStatsPanel from '@/components/Map/TyphoonStatsPanel.vue'
+import type { TyphoonPolicyStatsResponse } from '@/services/insuranceService'
 import { useMapStore } from '@/store/mapStore'
 import {
   getEarthquakeDataWithFilters,
@@ -227,6 +245,7 @@ import {
   type TyphoonPoint,
 } from '@/services/amapService'
 import { fromLonLat } from 'ol/proj'
+import * as turf from '@turf/turf'
 import VectorLayer from 'ol/layer/Vector'
 import VectorSource from 'ol/source/Vector'
 import Feature from 'ol/Feature'
@@ -234,6 +253,8 @@ import Point from 'ol/geom/Point'
 import { Style, Fill, Stroke, Text as TextStyle, Circle as CircleStyle } from 'ol/style'
 import LineString from 'ol/geom/LineString'
 import MultiPoint from 'ol/geom/MultiPoint'
+import Circle from 'ol/geom/Circle'
+import Polygon from 'ol/geom/Polygon'
 import { unlistenByKey } from 'ol/events'
 import type { EventsKey } from 'ol/events'
 
@@ -263,6 +284,12 @@ const depthRange = ref([0, 700])
 // 事件列表
 const eventListVisible = ref(true)
 const warnings = ref<Warning[]>([])
+
+// 台风保单查询
+const showTyphoonStats = ref(false)
+const typhoonStatsData = ref<TyphoonPolicyStatsResponse | null>(null)
+let policyLayer: VectorLayer<VectorSource> | null = null
+let selectedTyphoonTrajectoryPoints: Map<string, TyphoonPoint[]> = new Map()
 
 // 台风信息列表（用于台风信息面板展示）
 const typhoonInfoList = computed(() => {
@@ -499,12 +526,14 @@ async function onTyphoonSelect(ids: string[]) {
     if (typhoonTrajectoryLayer) typhoonTrajectoryLayer.setSource(new VectorSource())
     warnings.value = []
     typhoonDataMap.value = {}
+    selectedTyphoonTrajectoryPoints.clear()
     return
   }
 
   loading.value = true
   try {
     const allPoints: { tfid: string; points: TyphoonPoint[] }[] = []
+    selectedTyphoonTrajectoryPoints.clear()
     const selectedTyphoons = yearTyphoons.value.filter((t) => ids.includes(t.tfid))
     const typhoonMap: Record<string, TyphoonData> = {}
     selectedTyphoons.forEach((t) => { typhoonMap[t.tfid] = t })
@@ -517,6 +546,7 @@ async function onTyphoonSelect(ids: string[]) {
       const points = await getTyphoonPoints(tfid)
       if (points.length > 0) {
         allPoints.push({ tfid, points })
+        selectedTyphoonTrajectoryPoints.set(tfid, points)
       }
     }
 
@@ -1163,6 +1193,193 @@ function setupMapOverlay() {
   })
 }
 
+// ============ 台风保单查询 ============
+
+function getTyphoonData() {
+  const result: Array<{ tfid: string; name: string; enName: string; points: Array<{ lng: string; lat: string }> }> = []
+
+  for (const tfid of selectedTyphoonIds.value) {
+    const typhoon = yearTyphoons.value.find(t => t.tfid === tfid)
+    if (!typhoon) continue
+
+    // 优先使用选中时加载的轨迹数据
+    const trajectoryPoints = selectedTyphoonTrajectoryPoints.get(tfid)
+    if (trajectoryPoints && trajectoryPoints.length > 0) {
+      result.push({
+        tfid: typhoon.tfid,
+        name: typhoon.name,
+        enName: typhoon.enName,
+        points: trajectoryPoints.map(p => ({ lng: p.lng, lat: p.lat }))
+      })
+    } else {
+      // 尝试从缓存获取
+      const cached = trajectoryCache.get(tfid)
+      if (cached && cached.points.length > 0) {
+        result.push({
+          tfid: typhoon.tfid,
+          name: typhoon.name,
+          enName: typhoon.enName,
+          points: cached.points.map(p => ({ lng: p.lng, lat: p.lat }))
+        })
+      } else if (typhoon.lat != null && typhoon.lng != null) {
+        result.push({
+          tfid: typhoon.tfid,
+          name: typhoon.name,
+          enName: typhoon.enName,
+          points: [{ lng: String(typhoon.lng), lat: String(typhoon.lat) }]
+        })
+      }
+    }
+  }
+
+  return result
+}
+
+function onTyphoonQueryResult(data: TyphoonPolicyStatsResponse) {
+  typhoonStatsData.value = data
+  showTyphoonStats.value = true
+  drawPolicyPoints(data.policyGroups)
+}
+
+function onTyphoonQueryStart() {
+  clearPolicyResults()
+}
+
+function onTyphoonQueryEnd() {
+  // Query completed
+}
+
+function clearPolicyResults() {
+  if (policyLayer) {
+    policyLayer.getSource()?.clear()
+  }
+  clearBufferLayer()
+}
+
+function drawPolicyPoints(groups: Array<{ lng: number; lat: number; count: number; policies: any[] }>) {
+  ensurePolicyLayer()
+  const map = mapStore.map
+  if (!map || !policyLayer) return
+
+  const source = policyLayer.getSource()
+  if (!source) return
+  source.clear()
+
+  for (const group of groups) {
+    const feature = new Feature({
+      geometry: new Point(fromLonLat([group.lng, group.lat])),
+    })
+
+    const label = group.count > 1 ? String(group.count) : ''
+    feature.setStyle(new Style({
+      image: new CircleStyle({
+        radius: group.count > 1 ? 12 : 8,
+        fill: new Fill({ color: '#e6a23c' }),
+        stroke: new Stroke({ color: '#fff', width: 2 }),
+      }),
+      text: label ? new Text({
+        text: label,
+        font: 'bold 11px sans-serif',
+        fill: new Fill({ color: '#fff' }),
+      }) : undefined,
+    }))
+
+    feature.set('groupData', group)
+    source.addFeature(feature)
+  }
+}
+
+function ensurePolicyLayer() {
+  if (policyLayer) return
+  const map = mapStore.map
+  if (!map) return
+
+  policyLayer = new VectorLayer({
+    source: new VectorSource(),
+    zIndex: 20,
+  })
+  map.addLayer(policyLayer)
+}
+
+// ============ 台风路径缓冲区 ============
+
+let bufferLayer: VectorLayer<VectorSource> | null = null
+
+function ensureBufferLayer() {
+  if (bufferLayer) return
+  const map = mapStore.map
+  if (!map) return
+
+  bufferLayer = new VectorLayer({
+    source: new VectorSource(),
+    zIndex: 19,
+  })
+  map.addLayer(bufferLayer)
+}
+
+function onBufferData(data: { typhoons: Array<{ tfid: string; points: Array<{ lng: number; lat: number }> }>, radius: number }) {
+  ensureBufferLayer()
+  const map = mapStore.map
+  if (!map || !bufferLayer) return
+
+  const source = bufferLayer.getSource()
+  if (!source) return
+  source.clear()
+
+  const radiusKm = data.radius
+
+  for (const typhoon of data.typhoons) {
+    if (typhoon.points.length === 0) continue
+
+    // Create LineString in WGS84 for turf
+    const lineCoords = typhoon.points.map(p => [p.lng, p.lat])
+
+    if (lineCoords.length >= 2) {
+      // Use turf to create buffer around the line
+      const line = turf.lineString(lineCoords)
+      const buffered = turf.buffer(line, radiusKm, { units: 'kilometers' })
+
+      // Convert turf polygon to OpenLayers polygon
+      const olCoords = buffered.geometry.coordinates[0].map((coord: number[]) => fromLonLat(coord))
+      const polygonGeom = new Polygon([olCoords])
+
+      const feature = new Feature({ geometry: polygonGeom })
+      feature.setStyle(new Style({
+        stroke: new Stroke({ color: '#409eff', width: 1.5, lineDash: [6, 4] }),
+        fill: new Fill({ color: 'rgba(64, 158, 255, 0.08)' }),
+      }))
+      source.addFeature(feature)
+    } else if (lineCoords.length === 1) {
+      // Single point - create circle buffer
+      const center = fromLonLat(lineCoords[0])
+      const circleGeom = new Circle(center, radiusKm * 1000)
+
+      const feature = new Feature({ geometry: circleGeom })
+      feature.setStyle(new Style({
+        stroke: new Stroke({ color: '#409eff', width: 1.5, lineDash: [6, 4] }),
+        fill: new Fill({ color: 'rgba(64, 158, 255, 0.08)' }),
+      }))
+      source.addFeature(feature)
+    }
+
+    // Draw trajectory line
+    if (typhoon.points.length > 1) {
+      const coords = typhoon.points.map(p => fromLonLat([p.lng, p.lat]))
+      const lineFeature = new Feature({ geometry: new LineString(coords) })
+      lineFeature.setStyle(new Style({
+        stroke: new Stroke({ color: '#409eff', width: 2, lineDash: [8, 4] }),
+      }))
+      source.addFeature(lineFeature)
+    }
+  }
+}
+
+function clearBufferLayer() {
+  if (bufferLayer) {
+    bufferLayer.getSource()?.clear()
+  }
+}
+
 // ============ 生命周期 ============
 
 function waitForMap() {
@@ -1183,6 +1400,8 @@ onUnmounted(() => {
   if (map && floodLayer) map.removeLayer(floodLayer)
   if (map && typhoonLayer) map.removeLayer(typhoonLayer)
   if (map && typhoonTrajectoryLayer) map.removeLayer(typhoonTrajectoryLayer)
+  if (map && policyLayer) map.removeLayer(policyLayer)
+  if (map && bufferLayer) map.removeLayer(bufferLayer)
   if (mapClickKey) {
     unlistenByKey(mapClickKey)
     mapClickKey = null
