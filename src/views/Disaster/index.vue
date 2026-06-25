@@ -330,6 +330,7 @@ let trajectoryPoints: TyphoonPoint[] = []
 // 存储各类型标记的屏幕坐标，用于点击命中查询（绕过 forEachFeatureAtPixel）
 let typhoonMarkers: { data: any; coord: number[] }[] = []
 let otherMarkers: { data: any; coord: number[] }[] = []
+let policyMarkers: { data: any; coord: number[] }[] = []
 
 function findNearestFeature(clickPx: number[], markers: { data: any; coord: number[] }[], maxPxDist: number): any | null {
   const map = mapStore.map
@@ -366,7 +367,16 @@ function createPopupField(): HTMLDivElement {
 }
 
 function ensurePopupStructure() {
-  if (!popupContainer || popupTitleEl) return
+  if (!popupContainer) return
+  // 如果结构已存在且未被覆盖，直接返回
+  if (popupTitleEl && popupTitleEl.parentNode === popupContainer) return
+
+  // 清空容器，重建旧结构
+  popupContainer.innerHTML = ''
+  popupContainer.style.width = ''
+  popupContainer.style.maxHeight = ''
+  popupContainer.style.overflow = ''
+
   popupTitleEl = document.createElement('div')
   popupTitleEl.style.cssText = 'font-weight:bold;margin-bottom:6px;color:#303133;'
   popupContainer.appendChild(popupTitleEl)
@@ -388,10 +398,12 @@ function ensurePopupStructure() {
 
 function showPopup(coordinate: number[]) {
   if (!popupContainer) return
-  // 隐藏未使用的字段（textContent 为空的）
-  ;[popupField1El, popupField2El, popupField3El, popupField4El, popupBtnEl].forEach((el) => {
-    if (el) el.style.display = el.textContent ? '' : 'none'
-  })
+  // 隐藏未使用的字段（textContent 为空的），仅在使用旧结构时
+  if (popupTitleEl && popupTitleEl.parentNode === popupContainer) {
+    ;[popupField1El, popupField2El, popupField3El, popupField4El, popupBtnEl].forEach((el) => {
+      if (el) el.style.display = el.textContent ? '' : 'none'
+    })
+  }
   // 用 CSS 定位弹窗，绕过 OL Overlay 触发的同步重绘
   const map = mapStore.map
   if (map) {
@@ -419,6 +431,9 @@ function resetPopupFields() {
 function hidePopup() {
   if (!popupContainer) return
   popupContainer.style.visibility = 'hidden'
+  popupContainer.style.width = ''
+  popupContainer.style.maxHeight = ''
+  popupContainer.style.overflow = ''
   popupVisible = false
 }
 
@@ -453,6 +468,7 @@ function toggleType(type: string) {
   clearAllLayers()
   warnings.value = []
   typhoonDataMap.value = {}
+  eventListVisible.value = true
   // 重置各灾害类型筛选状态
   typhoonMode.value = 'realtime'
   selectedYear.value = null
@@ -470,6 +486,9 @@ function clearAllLayers() {
   if (floodLayer) floodLayer.setSource(new VectorSource())
   if (typhoonLayer) typhoonLayer.setSource(new VectorSource())
   if (typhoonTrajectoryLayer) typhoonTrajectoryLayer.setSource(new VectorSource())
+  clearPolicyResults()
+  showTyphoonStats.value = false
+  typhoonStatsData.value = null
   hidePopup()
   trajectoryCache.clear()
   trajectoryCoords = []
@@ -501,6 +520,7 @@ function onTyphoonModeChange(mode: string) {
   selectedTyphoonIds.value = []
   selectedYear.value = null
   yearTyphoons.value = []
+  selectedTyphoonTrajectoryPoints.clear()
   if (mode === 'realtime') {
     fetchActiveTyphoons()
   } else {
@@ -616,11 +636,51 @@ async function fetchActiveTyphoons() {
       .map((t) => ({ data: t, coord: fromLonLat([t.lng, t.lat]) }))
 
     hidePopup()
-    if (typhoonTrajectoryLayer) typhoonTrajectoryLayer.setSource(new VectorSource())
+
+    // 加载所有活跃台风的轨迹
+    const allPoints: { tfid: string; points: TyphoonPoint[] }[] = []
+    selectedTyphoonTrajectoryPoints.clear()
+    for (const typhoon of data) {
+      const points = await getTyphoonPoints(typhoon.tfid)
+      if (points.length > 0) {
+        allPoints.push({ tfid: typhoon.tfid, points })
+        selectedTyphoonTrajectoryPoints.set(typhoon.tfid, points)
+      }
+    }
 
     const layer = ensureTyphoonLayer()
     if (layer) {
       layer.setSource(new VectorSource({ features: createTyphoonFeatures(data) }))
+    }
+
+    // 绘制轨迹线和轨迹点
+    const trajLayer = ensureTyphoonTrajectoryLayer()
+    if (trajLayer) {
+      const allFeatures: Feature[] = []
+      const mergedPoints: TyphoonPoint[] = []
+      for (const item of allPoints) {
+        mergedPoints.push(...item.points)
+        allFeatures.push(...createTyphoonTrajectoryLineFeatures(item.points))
+      }
+      if (mergedPoints.length > 0) {
+        allFeatures.push(...createTyphoonTrajectoryPointFeatures(mergedPoints))
+      }
+      trajLayer.setSource(new VectorSource({ features: allFeatures }))
+    }
+
+    // 自动定位到轨迹范围
+    const map = mapStore.map
+    if (map && allPoints.length > 0) {
+      const allCoords: number[][] = []
+      for (const item of allPoints) {
+        for (const p of item.points) {
+          allCoords.push(fromLonLat([parseFloat(p.lng), parseFloat(p.lat)]))
+        }
+      }
+      if (allCoords.length > 0) {
+        const extent = new LineString(allCoords).getExtent()
+        map.getView().fit(extent, { padding: [100, 400, 100, 100], duration: 0 })
+      }
     }
   } finally {
     loading.value = false
@@ -929,6 +989,87 @@ function showFloodPopup(fw: FloodWarningData, coordinate: number[]) {
   showPopup(coordinate)
 }
 
+function showPolicyPopup(group: any, coordinate: number[]) {
+  if (!popupContainer) return
+
+  // 重新创建弹窗结构，支持保单列表
+  popupContainer.innerHTML = ''
+  popupContainer.style.width = '280px'
+  popupContainer.style.maxHeight = '400px'
+  popupContainer.style.overflow = 'hidden'
+
+  // 标题栏
+  const header = document.createElement('div')
+  header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #ebeef5;'
+  const title = document.createElement('span')
+  title.style.cssText = 'font-size:14px;font-weight:600;color:#303133;'
+  title.textContent = `保单列表 (${group.count}条)`
+  header.appendChild(title)
+  const closeBtn = document.createElement('span')
+  closeBtn.style.cssText = 'font-size:18px;color:#909399;cursor:pointer;line-height:1;'
+  closeBtn.textContent = '×'
+  closeBtn.onclick = () => hidePopup()
+  header.appendChild(closeBtn)
+  popupContainer.appendChild(header)
+
+  // 保单列表
+  const body = document.createElement('div')
+  body.style.cssText = 'overflow-y:auto;max-height:350px;padding:8px;'
+
+  const policies = group.policies || []
+  for (const policy of policies) {
+    const item = document.createElement('div')
+    item.style.cssText = 'padding:10px;border:1px solid #ebeef5;border-radius:6px;margin-bottom:8px;'
+
+    // 保单头部：保单号 + 险种
+    const itemHeader = document.createElement('div')
+    itemHeader.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;'
+    const policyNo = document.createElement('span')
+    policyNo.style.cssText = 'font-size:13px;font-weight:600;color:#303133;'
+    policyNo.textContent = policy.policyNo
+    itemHeader.appendChild(policyNo)
+    const typeName = document.createElement('span')
+    typeName.style.cssText = 'font-size:12px;color:#409eff;background:#ecf5ff;padding:2px 8px;border-radius:4px;'
+    typeName.textContent = policy.typeName || ''
+    itemHeader.appendChild(typeName)
+    item.appendChild(itemHeader)
+
+    // 保单详情
+    const detail = document.createElement('div')
+    const rows = [
+      { label: '投保人：', value: policy.policyHolder },
+      { label: '被保险人：', value: policy.insuredName },
+      { label: '险类：', value: policy.categoryName },
+      { label: '保额：', value: policy.coverageAmount?.toLocaleString() + ' 元' },
+      { label: '保费：', value: policy.premium?.toLocaleString() + ' 元' },
+      { label: '标的序号：', value: policy.targetNo },
+      { label: '保险期间：', value: `${policy.startDate} 至 ${policy.endDate}` },
+    ]
+    if (policy.address) {
+      rows.push({ label: '地址：', value: policy.address })
+    }
+
+    for (const row of rows) {
+      const rowEl = document.createElement('div')
+      rowEl.style.cssText = 'display:flex;font-size:12px;line-height:1.8;'
+      const labelEl = document.createElement('span')
+      labelEl.style.cssText = 'color:#909399;flex-shrink:0;width:70px;'
+      labelEl.textContent = row.label
+      rowEl.appendChild(labelEl)
+      const valueEl = document.createElement('span')
+      valueEl.style.cssText = 'color:#303133;flex:1;'
+      valueEl.textContent = row.value || ''
+      rowEl.appendChild(valueEl)
+      detail.appendChild(rowEl)
+    }
+    item.appendChild(detail)
+    body.appendChild(item)
+  }
+
+  popupContainer.appendChild(body)
+  showPopup(coordinate)
+}
+
 // ============ 台风相关 ============
 
 function getTyphoonColor(strong: string): string {
@@ -1178,7 +1319,14 @@ function setupMapOverlay() {
       return
     }
 
-    // 3. 查地震/洪水等其他标记
+    // 3. 查保单标记
+    const policyHit = findNearestFeature(clickPx, policyMarkers, 15)
+    if (policyHit) {
+      showPolicyPopup(policyHit, coordinate)
+      return
+    }
+
+    // 4. 查地震/洪水等其他标记
     const otherHit = findNearestFeature(clickPx, otherMarkers, 15)
     if (otherHit && (otherHit as any).magnitude != null) {
       showEarthquakePopup(otherHit as EarthquakeData, coordinate)
@@ -1198,8 +1346,14 @@ function setupMapOverlay() {
 function getTyphoonData() {
   const result: Array<{ tfid: string; name: string; enName: string; points: Array<{ lng: string; lat: string }> }> = []
 
-  for (const tfid of selectedTyphoonIds.value) {
-    const typhoon = yearTyphoons.value.find(t => t.tfid === tfid)
+  // 实时台风模式：使用 typhoonDataMap 中的所有活跃台风
+  // 历史台风模式：使用 selectedTyphoonIds 中选中的台风
+  const typhoonIds = typhoonMode.value === 'realtime'
+    ? Object.keys(typhoonDataMap.value)
+    : selectedTyphoonIds.value
+
+  for (const tfid of typhoonIds) {
+    const typhoon = typhoonDataMap.value[tfid]
     if (!typhoon) continue
 
     // 优先使用选中时加载的轨迹数据
@@ -1253,6 +1407,7 @@ function clearPolicyResults() {
   if (policyLayer) {
     policyLayer.getSource()?.clear()
   }
+  policyMarkers = []
   clearBufferLayer()
 }
 
@@ -1264,10 +1419,12 @@ function drawPolicyPoints(groups: Array<{ lng: number; lat: number; count: numbe
   const source = policyLayer.getSource()
   if (!source) return
   source.clear()
+  policyMarkers = []
 
   for (const group of groups) {
+    const coord = fromLonLat([group.lng, group.lat])
     const feature = new Feature({
-      geometry: new Point(fromLonLat([group.lng, group.lat])),
+      geometry: new Point(coord),
     })
 
     const label = group.count > 1 ? String(group.count) : ''
@@ -1286,6 +1443,7 @@ function drawPolicyPoints(groups: Array<{ lng: number; lat: number; count: numbe
 
     feature.set('groupData', group)
     source.addFeature(feature)
+    policyMarkers.push({ data: group, coord })
   }
 }
 
