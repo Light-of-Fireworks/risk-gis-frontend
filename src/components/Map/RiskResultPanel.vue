@@ -1,20 +1,21 @@
 <template>
   <div v-if="visible" class="risk-result-panel">
-    <div class="panel-header">
-      <span class="header-title">风险评级结果</span>
-      <span class="header-close" @click="$emit('close')">&times;</span>
+    <div class="panel-header" @click="collapsed = !collapsed">
+      <span class="header-title">查询结果</span>
+      <svg
+        :class="['header-toggle', { collapsed: collapsed }]"
+        viewBox="0 0 1024 1024"
+        width="14"
+        height="14"
+        fill="currentColor"
+      >
+        <path d="M715.8 493.5L335 165.1c-14.2-12.3-35-12.3-49.2 0l-40.2 34.5c-14.2 12.3-14.2 32.1 0 44.4l355.6 308.1c14.2 12.3 35 12.3 49.2 0l355.6-308.1c14.2-12.3 14.2-32.1 0-44.4l-40.2-34.5c-14.2-12.3-35-12.3-49.2 0z"/>
+      </svg>
     </div>
 
-    <div class="panel-body">
-      <!-- 综合评级 -->
-      <div class="overall-section">
-        <div class="overall-level" :style="{ color: levelColor }">
-          {{ levelLabel }}
-        </div>
-        <div class="overall-score">
-          综合评分：<strong>{{ overallScoreText }}</strong>
-        </div>
-      </div>
+    <div class="panel-body" v-show="!collapsed">
+      <div class="section-title">风险评级</div>
+      <div class="section-divider"></div>
 
       <!-- 各灾害类型列表 -->
       <div class="assessments-list">
@@ -54,23 +55,52 @@
           </div>
         </div>
       </div>
+
+      <!-- 周边标的统计 -->
+      <div v-if="policyStats" class="policy-stats-section">
+        <div class="stats-table-header">
+          <span class="col-name">周边标的</span>
+          <span class="col-count">标的数量</span>
+          <span class="col-amount">保额(万元)</span>
+          <span class="col-amount">保费(万元)</span>
+        </div>
+        <div
+          v-for="cat in policyStats.categories"
+          :key="cat.typeName"
+          class="stats-table-row"
+        >
+          <span class="col-name">{{ cat.typeName }}</span>
+          <span class="col-count">{{ cat.targetCount }}</span>
+          <span class="col-amount">{{ formatToWan(cat.coverageAmount) }}</span>
+          <span class="col-amount">{{ formatToWan(cat.premium) }}</span>
+        </div>
+        <div class="stats-table-row total-row">
+          <span class="col-name">合计</span>
+          <span class="col-count">{{ policyStats.targetCount }}</span>
+          <span class="col-amount">{{ formatToWan(policyStats.coverageAmount) }}</span>
+          <span class="col-amount">{{ formatToWan(policyStats.premium) }}</span>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref } from 'vue'
 import type { RiskAssessResponse } from '@/services/riskAssess'
+import type { PolicyStats } from '@/services/insuranceService'
 
 const props = defineProps<{
   visible: boolean
   data: RiskAssessResponse | null
+  policyStats?: PolicyStats | null
 }>()
 
 defineEmits<{
   (e: 'close'): void
 }>()
 
+const collapsed = ref(false)
 const expandedTypes = ref(new Set<string>())
 
 function toggleExpand(type: string) {
@@ -103,13 +133,11 @@ function getLevelLabel(level: string): string {
   return LEVEL_LABELS[level] || level
 }
 
-const levelColor = computed(() => getLevelColor(props.data?.overallRiskLevel || ''))
-const levelLabel = computed(() => getLevelLabel(props.data?.overallRiskLevel || ''))
-const overallScoreText = computed(() => {
-  const score = props.data?.overallRiskScore
-  if (score == null) return '--'
-  return Number(score).toFixed(1)
-})
+function formatToWan(amount: number): string {
+  return (amount / 10000).toFixed(2)
+}
+
+
 </script>
 
 <style lang="scss" scoped>
@@ -117,7 +145,7 @@ const overallScoreText = computed(() => {
   position: absolute;
   top: 10px;
   right: 10px;
-  width: 300px;
+  width: 360px;
   max-height: calc(100% - 20px);
   background: rgba(255, 255, 255, 0.96);
   border-radius: 8px;
@@ -133,6 +161,13 @@ const overallScoreText = computed(() => {
   justify-content: space-between;
   padding: 10px 14px;
   border-bottom: 1px solid #ebeef5;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.2s;
+
+  &:hover {
+    background: #f5f7fa;
+  }
 
   .header-title {
     font-size: 14px;
@@ -140,14 +175,19 @@ const overallScoreText = computed(() => {
     color: #303133;
   }
 
-  .header-close {
-    font-size: 18px;
+  .header-toggle {
     color: #909399;
     cursor: pointer;
-    line-height: 1;
+    transition: transform 0.2s;
 
     &:hover {
-      color: #f56c6c;
+      color: #303133;
+    }
+
+    transform: rotate(180deg);
+
+    &.collapsed {
+      transform: rotate(0deg);
     }
   }
 }
@@ -157,26 +197,17 @@ const overallScoreText = computed(() => {
   padding: 12px;
 }
 
-.overall-section {
-  text-align: center;
-  padding-bottom: 12px;
-  border-bottom: 1px solid #ebeef5;
+.section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #303133;
+  margin-bottom: 6px;
+}
+
+.section-divider {
+  height: 1px;
+  background: #ebeef5;
   margin-bottom: 12px;
-
-  .overall-level {
-    font-size: 20px;
-    font-weight: 700;
-  }
-
-  .overall-score {
-    font-size: 13px;
-    color: #606266;
-    margin-top: 4px;
-
-    strong {
-      font-size: 16px;
-    }
-  }
 }
 
 .assessments-list {
@@ -305,6 +336,62 @@ const overallScoreText = computed(() => {
       text-align: right;
       color: #606266;
     }
+  }
+}
+
+.policy-stats-section {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #ebeef5;
+
+  .stats-table-header,
+  .stats-table-row {
+    display: flex;
+    align-items: center;
+    padding: 6px 0;
+    font-size: 13px;
+
+    .col-name {
+      flex: 1;
+      color: #606266;
+    }
+
+    .col-count {
+      width: 60px;
+      text-align: right;
+      margin-right: 8px;
+    }
+
+    .col-amount {
+      width: 80px;
+      text-align: right;
+      color: #303133;
+    }
+  }
+
+  .stats-table-header {
+    font-size: 12px;
+    color: #909399;
+
+    .col-count,
+    .col-amount {
+      color: #909399;
+    }
+  }
+
+  .stats-table-row {
+    color: #303133;
+
+    .col-name {
+      color: #303133;
+    }
+  }
+
+  .total-row {
+    margin-top: 4px;
+    padding-top: 6px;
+    border-top: 1px solid #ebeef5;
+    font-weight: 600;
   }
 }
 </style>

@@ -1,8 +1,8 @@
 <template>
   <div class="map-container">
     <div ref="mapRef" class="map"></div>
-    <RiskQuery v-if="showRiskQuery" @risk-result="onRiskResult" />
-    <RiskResultPanel :visible="showRiskResult" :data="riskResultData" @close="showRiskResult = false" />
+    <RiskQuery v-if="showRiskQuery" @risk-result="onRiskResult" @policy-stats="onPolicyStats" />
+    <RiskResultPanel :visible="showRiskResult" :data="riskResultData" :policyStats="policyStatsData" />
     <div class="map-controls">
       <DrawTools @measure-change="handleMeasureChange" @clear="clearDrawings" />
     </div>
@@ -26,6 +26,7 @@ import DrawTools from './DrawTools.vue'
 import RiskQuery from './RiskQuery.vue'
 import RiskResultPanel from './RiskResultPanel.vue'
 import type { RiskAssessResponse } from '@/services/riskAssess'
+import type { PolicyStats } from '@/services/insuranceService'
 import Popup from './Popup.vue'
 import Loading from '@/components/Common/Loading.vue'
 
@@ -53,6 +54,7 @@ const scaleText = ref('')
 
 const showRiskResult = ref(false)
 const riskResultData = ref<RiskAssessResponse | null>(null)
+const policyStatsData = ref<PolicyStats | null>(null)
 
 const popupVisible = ref(false)
 const popupTitle = ref('')
@@ -80,9 +82,18 @@ const drawStyles = {
   }),
 }
 
-function onRiskResult(data: RiskAssessResponse) {
+function onRiskResult(data: RiskAssessResponse | null) {
+  if (data == null) {
+    showRiskResult.value = false
+    riskResultData.value = null
+    return
+  }
   riskResultData.value = data
   showRiskResult.value = true
+}
+
+function onPolicyStats(data: PolicyStats | null) {
+  policyStatsData.value = data
 }
 
 function destroyMap() {

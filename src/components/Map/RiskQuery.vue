@@ -280,7 +280,7 @@ import {
   reverseGeocode,
   getSubDistricts,
 } from '@/services/amapService'
-import { insuranceService, type InsurancePolicyGroupVO } from '@/services/insuranceService'
+import { insuranceService, type InsurancePolicyGroupVO, type PolicyStats, type CategoryPolicyStats } from '@/services/insuranceService'
 import { riskAssessService, type RiskAssessResponse } from '@/services/riskAssess'
 import { fromLonLat, toLonLat } from 'ol/proj'
 import VectorLayer from 'ol/layer/Vector'
@@ -300,7 +300,8 @@ import { unByKey } from 'ol/Observable'
 
 const mapStore = useMapStore()
 const emit = defineEmits<{
-  (e: 'risk-result', data: RiskAssessResponse): void
+  (e: 'risk-result', data: RiskAssessResponse | null): void
+  (e: 'policy-stats', data: PolicyStats | null): void
 }>()
 const expanded = ref(true)
 const mode = ref<'point' | 'region'>('point')
@@ -368,6 +369,7 @@ function resetInsuranceQuery() {
   searchRadius.value = 2
   resetInsuranceSelection()
   clearPolicyResults()
+  emit('policy-stats', null)
 }
 
 // === 保单查询 ===
@@ -378,7 +380,45 @@ async function handleQuery() {
   // 2. 保单查询（仅在开关开启时执行）
   if (insuranceEnabled.value) {
     await handleInsuranceQuery()
+    emitPolicyStats()
+  } else {
+    emit('policy-stats', null)
   }
+}
+
+function emitPolicyStats() {
+  let targetCount = 0
+  let coverageAmount = 0
+  let premium = 0
+  const categoryMap = new Map<string, { targetCount: number; coverageAmount: number; premium: number }>()
+
+  for (const group of policyGroups.value) {
+    targetCount += group.count
+    for (const policy of group.policies) {
+      coverageAmount += policy.coverageAmount || 0
+      premium += policy.premium || 0
+
+      const name = policy.typeName || '其他'
+      const cat = categoryMap.get(name)
+      if (cat) {
+        cat.targetCount += 1
+        cat.coverageAmount += policy.coverageAmount || 0
+        cat.premium += policy.premium || 0
+      } else {
+        categoryMap.set(name, {
+          targetCount: 1,
+          coverageAmount: policy.coverageAmount || 0,
+          premium: policy.premium || 0,
+        })
+      }
+    }
+  }
+
+  const categories: CategoryPolicyStats[] = Array.from(categoryMap.entries())
+    .map(([typeName, stats]) => ({ typeName, ...stats }))
+    .sort((a, b) => b.targetCount - a.targetCount)
+
+  emit('policy-stats', targetCount > 0 ? { targetCount, coverageAmount, premium, categories } : null)
 }
 
 async function handleRiskAssess() {
@@ -399,13 +439,9 @@ async function handleRiskAssess() {
         ElMessage.warning('请先选择一个区域')
         return
       }
-      if (selectedDistrictAdcode.value) {
-        result = await riskAssessService.assessRegion(selectedDistrictAdcode.value)
-      } else {
-        result = await riskAssessService.assessArea({
-          geometry: regionGeometry.value,
-        })
-      }
+      result = await riskAssessService.assessArea({
+        geometry: regionGeometry.value,
+      })
     }
 
     emit('risk-result', result)
@@ -828,6 +864,7 @@ function switchMode(m: 'point' | 'region') {
   selectedDisplayPath.value = []
   resetInsuranceQuery()
   clearPolicyResults()
+  emit('risk-result', null)
 }
 
 // === 单点模式 ===

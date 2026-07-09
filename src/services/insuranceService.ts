@@ -28,6 +28,20 @@ export interface InsurancePolicyVO {
   address: string
 }
 
+export interface CategoryPolicyStats {
+  typeName: string
+  targetCount: number
+  coverageAmount: number
+  premium: number
+}
+
+export interface PolicyStats {
+  targetCount: number
+  coverageAmount: number
+  premium: number
+  categories: CategoryPolicyStats[]
+}
+
 export interface InsurancePolicyGroupVO {
   lng: number
   lat: number
