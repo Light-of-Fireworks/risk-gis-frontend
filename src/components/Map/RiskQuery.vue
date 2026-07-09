@@ -31,7 +31,7 @@
             clearable
             size="small"
             @input="onPointInput"
-            @focus="showSuggestions = true"
+            @focus="onFocus"
             @clear="clearPointSearch"
           >
             <template #append>
@@ -46,6 +46,25 @@
           </el-input>
         </div>
 
+
+        <!-- 历史记录 -->
+        <div v-if="showHistory && pointHistory.length > 0 && mode === 'point'" class="suggestions-list history-list">
+          <div class="history-header">
+            <span>最近选择</span>
+          </div>
+          <div
+            v-for="(item, idx) in pointHistory"
+            :key="idx"
+            class="suggestion-item"
+            @click="selectHistoryItem(item)"
+          >
+            <div class="history-item-content">
+              <div class="suggestion-name">{{ item.address }}</div>
+              <div class="suggestion-addr">{{ item.lng.toFixed(6) }}, {{ item.lat.toFixed(6) }}</div>
+            </div>
+            <span class="history-item-remove" @click.stop="removeHistoryItem(idx)">×</span>
+          </div>
+        </div>
         <!-- 输入提示列表 -->
         <div v-if="showSuggestions && suggestions.length > 0" class="suggestions-list">
           <div
@@ -292,6 +311,10 @@ const suggestions = ref<any[]>([])
 const showSuggestions = ref(false)
 const locatingMode = ref(false)
 const pointInfo = ref<{ address: string; lng: number; lat: number } | null>(null)
+
+// === 单点历史记录 ===
+const showHistory = ref(false)
+const pointHistory = ref<{ address: string; lng: number; lat: number; timestamp: number }[]>([])
 
 // === 查询保单 ===
 const insuranceEnabled = ref(false)
@@ -822,12 +845,16 @@ function onPointInput(val: string) {
   if (inputTimer) clearTimeout(inputTimer)
   if (!val.trim()) {
     suggestions.value = []
+    showSuggestions.value = false
+    showHistory.value = true
     return
   }
+  showHistory.value = false
   inputTimer = setTimeout(async () => {
     try {
       const tips = await autoCompleteInput(val)
       suggestions.value = tips.filter((t: any) => t.location)
+      if (suggestions.value.length > 0) showSuggestions.value = true
     } catch {
       suggestions.value = []
     }
@@ -836,6 +863,7 @@ function onPointInput(val: string) {
 
 function selectSuggestion(item: any) {
   showSuggestions.value = false
+  showHistory.value = false
   pointKeyword.value = item.name
   suggestions.value = []
 
@@ -895,12 +923,14 @@ function setPointOnMap(lng: number, lat: number, label: string) {
   })
 
   pointInfo.value = { address: label, lng, lat }
+  saveToPointHistory(label, lng, lat)
 }
 
 function clearPointSearch() {
   pointKeyword.value = ''
   suggestions.value = []
   showSuggestions.value = false
+  showHistory.value = false
   locatingMode.value = false
   pointInfo.value = null
   if (pointLayer) {
@@ -909,6 +939,53 @@ function clearPointSearch() {
   const map = getMap()
   if (map) map.getTargetElement().style.cursor = ''
   clearPolicyResults()
+}
+
+// === 单点历史记录 ===
+function loadPointHistory() {
+  try {
+    const raw = localStorage.getItem('risk-query-point-history')
+    pointHistory.value = raw ? JSON.parse(raw) : []
+  } catch {
+    pointHistory.value = []
+  }
+}
+
+function saveToPointHistory(address: string, lng: number, lat: number) {
+  const filtered = pointHistory.value.filter(h => !(h.lng === lng && h.lat === lat))
+  filtered.unshift({ address, lng, lat, timestamp: Date.now() })
+  pointHistory.value = filtered.slice(0, 15)
+  localStorage.setItem('risk-query-point-history', JSON.stringify(pointHistory.value))
+}
+
+function clearPointHistory() {
+  pointHistory.value = []
+  showHistory.value = false
+  localStorage.removeItem('risk-query-point-history')
+}
+
+function removeHistoryItem(idx: number) {
+  pointHistory.value.splice(idx, 1)
+  localStorage.setItem('risk-query-point-history', JSON.stringify(pointHistory.value))
+  if (pointHistory.value.length === 0) {
+    showHistory.value = false
+  }
+}
+
+function selectHistoryItem(item: { address: string; lng: number; lat: number }) {
+  pointKeyword.value = item.address
+  showHistory.value = false
+  showSuggestions.value = false
+  setPointOnMap(item.lng, item.lat, item.address)
+}
+
+function onFocus() {
+  if (pointKeyword.value.length === 0) {
+    showSuggestions.value = false
+    showHistory.value = true
+  } else {
+    showHistory.value = false
+  }
 }
 
 // === 区域模式 ===
@@ -1207,6 +1284,8 @@ function removeDrawInteraction() {
 onMounted(() => {
   loadInsuranceTree()
 
+  loadPointHistory()
+
   // 等地图初始化
   const checkMap = () => {
     const map = getMap()
@@ -1237,6 +1316,7 @@ function handleDocClick(e: MouseEvent) {
   if (!target.closest('.risk-query')) {
     showSuggestions.value = false
     showCascading.value = false
+    showHistory.value = false
   }
 }
 
@@ -1453,6 +1533,46 @@ onUnmounted(() => {
       margin-top: 2px;
     }
   }
+
+  &.history-list .suggestion-item {
+    display: flex;
+    align-items: center;
+
+    .history-item-content {
+      flex: 1;
+      min-width: 0;
+    }
+  }
+
+  .history-item-remove {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    color: #c0c4cc;
+    cursor: pointer;
+    flex-shrink: 0;
+    margin-left: 8px;
+    transition: all 0.15s;
+    line-height: 1;
+    user-select: none;
+
+    &:hover {
+      color: #f56c6c;
+      background: #fef0f0;
+    }
+  }
+
+  .history-header {
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #909399;
+    border-bottom: 1px solid #f0f2f5;
+  }
+
 }
 
 .point-info,
